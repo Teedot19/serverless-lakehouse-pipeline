@@ -23,6 +23,10 @@ This pipeline shows how to build a scalable, production-style Lakehouse using:
 
 The result is a true modern data stack without vendor lock-in or unnecessary cost.
 
+
+
+![architecture Diagram](./architecture.png)
+
 **🏗️ Medallion Layers**
 --
 **RAW Layer**
