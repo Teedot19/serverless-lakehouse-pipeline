@@ -1,0 +1,116 @@
+import sys
+import json
+from datetime import datetime
+
+import boto3
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.utils import getResolvedOptions
+
+# ---------------------------------------------------------------
+# Job Arguments
+# ---------------------------------------------------------------
+args = getResolvedOptions(
+    sys.argv,
+    ["JOB_NAME", "run_id", "input_uri"]
+)
+
+input_uri = args["input_uri"]
+run_id = args["run_id"]
+
+# ---------------------------------------------------------------
+# Spark & Glue Context Setup
+# ---------------------------------------------------------------
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+# ---------------------------------------------------------------
+# Read Raw Input
+# ---------------------------------------------------------------
+raw_df = spark.read.parquet(input_uri)
+
+# ---------------------------------------------------------------
+# Data Normalization Logic
+# ---------------------------------------------------------------
+def normalize_data(df):
+
+    start_date = F.to_date(F.lit("2024-01-01"))
+
+    return (
+        df
+        .filter(F.col("total_amount") > 0)
+
+        # Pickup Timestamp
+        .withColumn("pickup_time", F.col("tpep_pickup_datetime").cast("timestamp"))
+
+        # Enforce minimum start date
+        .filter(F.col("pickup_time") >= start_date)
+
+        # Dropoff Timestamp
+        .withColumn("dropoff_time", F.col("tpep_dropoff_datetime").cast("timestamp"))
+
+        # Date Components
+        .withColumn("pickup_date", F.to_date(F.col("pickup_time")))
+        .withColumn("year", F.year(F.col("pickup_time")))
+        .withColumn("month", F.month(F.col("pickup_time")))
+        .withColumn("day", F.dayofmonth(F.col("pickup_time")))
+    )
+
+normalized_raw = normalize_data(raw_df)
+
+# ---------------------------------------------------------------
+# Target Output Path (Sanitized for GitHub)
+# ---------------------------------------------------------------
+target_path = "s3://<your-bucket>/bronze/nyc_taxi/"
+
+# ---------------------------------------------------------------
+# Ingestion Metadata Columns
+# ---------------------------------------------------------------
+now = datetime.now()
+
+final_bronze_df = (
+    normalized_raw
+    .withColumn("ingestion_date", F.lit(now.strftime("%Y-%m-%d")))
+    .withColumn("ingestion_year", F.lit(now.year))
+    .withColumn("ingestion_month", F.lit(now.month))
+    .withColumn("ingestion_day", F.lit(now.day))
+)
+
+# ---------------------------------------------------------------
+# Write Partitioned Bronze Output
+# ---------------------------------------------------------------
+specific_run_path = f"{target_path}job_run_id={run_id}/"
+
+final_bronze_df.write \
+    .mode("append") \
+    .partitionBy("ingestion_year", "ingestion_month", "ingestion_day") \
+    .parquet(specific_run_path)
+
+# ---------------------------------------------------------------
+# Write Metadata for Downstream Jobs
+# ---------------------------------------------------------------
+s3_client = boto3.client("s3")
+
+metadata_bucket = "<your-bucket>"
+metadata_key = f"orchestration_metadata/bronze_to_silver_run_{run_id}.json"
+
+payload = {"silver_input_uri": specific_run_path}
+
+s3_client.put_object(
+    Bucket=metadata_bucket,
+    Key=metadata_key,
+    Body=json.dumps(payload)
+)
+
+print(f"Metadata written to s3://{metadata_bucket}/{metadata_key}")
+
+# ---------------------------------------------------------------
+# Final Commit
+# ---------------------------------------------------------------
+job.commit()
