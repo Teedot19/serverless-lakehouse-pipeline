@@ -1,0 +1,162 @@
+import sys
+import json
+import boto3
+from pyspark import SparkConf
+from pyspark.context import SparkContext
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from awsglue.utils import getResolvedOptions
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+# ---------------------------------------------------------------
+# Job Arguments
+# ---------------------------------------------------------------
+args = getResolvedOptions(sys.argv, ["JOB_NAME", "run_id"])
+run_id = args["run_id"]
+
+s3_client = boto3.client("s3")
+
+# ---------------------------------------------------------------
+# Retrieve Bronze Output Metadata
+# ---------------------------------------------------------------
+metadata_bucket = "<your-bucket>"
+metadata_key = f"orchestration_metadata/bronze_to_silver_run_{run_id}.json"
+
+try:
+    response = s3_client.get_object(Bucket=metadata_bucket, Key=metadata_key)
+    metadata_body = response["Body"].read().decode("utf-8")
+    metadata_payload = json.loads(metadata_body)
+
+    input_uri_from_bronze = metadata_payload["silver_input_uri"]
+
+    print(f"Retrieved Bronze output path: {input_uri_from_bronze}")
+
+except s3_client.exceptions.NoSuchKey:
+    raise FileNotFoundError(
+        f"Metadata file not found: s3://{metadata_bucket}/{metadata_key}"
+    )
+
+# ---------------------------------------------------------------
+# Spark / Iceberg Configuration
+# ---------------------------------------------------------------
+conf = SparkConf()
+conf.set("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+conf.set("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+conf.set("spark.sql.catalog.glue_catalog.warehouse", "s3://<your-bucket>/silver")
+conf.set("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+conf.set("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+
+sc = SparkContext(conf=conf)
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+job = Job(glueContext)
+job.init(args["JOB_NAME"], args)
+
+# ---------------------------------------------------------------
+# Read From Bronze Output
+# ---------------------------------------------------------------
+bronze_df = spark.read.parquet(input_uri_from_bronze)
+
+# ---------------------------------------------------------------
+# Iceberg Table Configuration
+# ---------------------------------------------------------------
+iceberg_db = "silver_iceberg"
+iceberg_table = "nyc_taxi"
+full_table_name = f"glue_catalog.{iceberg_db}.{iceberg_table}"
+
+# ---------------------------------------------------------------
+# Transformations
+# ---------------------------------------------------------------
+def select_cols(df):
+    return df.select([
+        "year", "month", "day",
+        "pickup_date", "pickup_time", "dropoff_time",
+        "passenger_count", "trip_distance",
+        "payment_type", "fare_amount", "tip_amount", "total_amount"
+    ])
+
+
+def transform_cols(df):
+    return (
+        df
+        .withColumn(
+            "is_weekend",
+            F.when(
+                (F.dayofweek("pickup_date") == 1) | (F.dayofweek("pickup_date") == 7),
+                "yes"
+            ).otherwise("no")
+        )
+        .withColumn(
+            "charges",
+            F.round(F.col("total_amount") - (F.col("fare_amount") + F.col("tip_amount")), 2)
+        )
+        .withColumn(
+            "unique_trip_id",
+            F.hash("pickup_time", "dropoff_time", "passenger_count", "fare_amount")
+        )
+        .withColumn(
+            "payment_type",
+            F.when(F.col("payment_type") == 0, "flex_fare_trip")
+             .when(F.col("payment_type") == 1, "credit_card")
+             .when(F.col("payment_type") == 2, "cash")
+             .when(F.col("payment_type") == 3, "no_charge")
+             .when(F.col("payment_type") == 4, "dispute")
+             .when(F.col("payment_type") == 5, "unknown")
+             .when(F.col("payment_type") == 6, "voided_trip")
+             .otherwise("other_or_unspecified")
+        )
+    )
+
+selected_cols = select_cols(bronze_df)
+transformed_cols = transform_cols(selected_cols)
+
+# ---------------------------------------------------------------
+# Deduplication
+# ---------------------------------------------------------------
+window_spec = Window.partitionBy("unique_trip_id").orderBy(F.col("dropoff_time").desc())
+
+ranked = transformed_cols.withColumn("row_num", F.row_number().over(window_spec))
+unique_transformed = ranked.filter(F.col("row_num") == 1).drop("row_num")
+
+# Register for SQL operations
+unique_transformed.createOrReplaceTempView("incoming_updates")
+
+# ---------------------------------------------------------------
+# Helper: Generate MERGE SQL clauses
+# ---------------------------------------------------------------
+def generate_column_strings(df):
+    cols = df.columns
+    update_set = ", ".join([f"target.{c} = source.{c}" for c in cols])
+    insert_cols = ", ".join(cols)
+    insert_vals = ", ".join([f"source.{c}" for c in cols])
+    return update_set, insert_cols, insert_vals
+
+update_set, insert_cols, insert_values = generate_column_strings(transformed_cols)
+
+# ---------------------------------------------------------------
+# Create Iceberg Table if Missing
+# ---------------------------------------------------------------
+spark.sql(f"""
+  CREATE TABLE IF NOT EXISTS {full_table_name}
+  USING iceberg
+  OPTIONS ('format-version'='2')
+  PARTITIONED BY (year, month, day)
+  AS SELECT * FROM incoming_updates WHERE 1 = 0
+""")
+
+# ---------------------------------------------------------------
+# Upsert Into Iceberg Using MERGE
+# ---------------------------------------------------------------
+spark.sql(f"""
+  MERGE INTO {full_table_name} AS target
+  USING incoming_updates AS source
+    ON target.unique_trip_id = source.unique_trip_id
+  WHEN MATCHED THEN UPDATE SET {update_set}
+  WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_values})
+""")
+
+print(f"Merged data into Iceberg table: {full_table_name}")
+
+job.commit()
