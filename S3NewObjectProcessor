@@ -1,0 +1,73 @@
+import json
+import urllib.parse
+import boto3
+import logging
+
+# ---------------------------------------------------------------
+# Logging Configuration
+# ---------------------------------------------------------------
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ---------------------------------------------------------------
+# AWS Clients
+# ---------------------------------------------------------------
+glue_client = boto3.client("glue")
+
+# Name of the Glue job to trigger (sanitized)
+GLUE_JOB_NAME = "<your-glue-job-name>"
+
+# ---------------------------------------------------------------
+# Lambda Handler
+# ---------------------------------------------------------------
+def lambda_handler(event, context):
+    """
+    Trigger a Glue ETL job when a new file lands in the S3 raw/ prefix.
+    """
+
+    # -----------------------------------------------------------
+    # Parse S3 Event
+    # -----------------------------------------------------------
+    try:
+        record = event["Records"][0]
+        bucket = record["s3"]["bucket"]["name"]
+        key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+    except KeyError:
+        logger.error("Invalid S3 event structure")
+        return {"statusCode": 400}
+
+    logger.info(f"New S3 object detected: s3://{bucket}/{key}")
+
+    # -----------------------------------------------------------
+    # Only process files under the raw/ prefix
+    # -----------------------------------------------------------
+    if not key.startswith("raw/"):
+        logger.info("Skipping object outside raw/ prefix")
+        return {"statusCode": 200}
+
+    input_uri = f"s3://{bucket}/{key}"
+
+    # -----------------------------------------------------------
+    # Construct Glue Job Arguments
+    # -----------------------------------------------------------
+    arguments = {
+        "--input_uri": input_uri,
+        "--run_id": context.aws_request_id
+    }
+
+    logger.info(f"Starting Glue job with arguments: {arguments}")
+
+    # -----------------------------------------------------------
+    # Start Glue Job
+    # -----------------------------------------------------------
+    try:
+        response = glue_client.start_job_run(
+            JobName=GLUE_JOB_NAME,
+            Arguments=arguments
+        )
+        logger.info(f"Glue JobRunID: {response['JobRunId']}")
+        return {"statusCode": 200}
+
+    except Exception as e:
+        logger.error(f"Failed to start Glue job: {e}")
+        raise
